@@ -1,0 +1,17 @@
+{
+  "name": "npc-test",
+  "version": "1.0.0",
+  "description": "NPC Demo 双轨测试：Track 1 UI 行为测试 + Track 2 人设表现 Playtest",
+  "type": "module",
+  "scripts": {
+    "playtest": "node track2-persona/run-playtest.js",
+    "playtest:char1": "node track2-persona/run-playtest.js --char=char1",
+    "playtest:char2": "node track2-persona/run-playtest.js --char=char2",
+    "playtest:char3": "node track2-persona/run-playtest.js --char=char3",
+    "ui-test": "node track1-ui/ui-runner.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "puppeteer": "^22.0.0"
+  }
+}
