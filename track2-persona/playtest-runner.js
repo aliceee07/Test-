@@ -33,7 +33,25 @@ const CLOSE_THRESHOLD = 3;
  * @param {object} opts.responseSchema  JSON Schema
  * @returns {Promise<object>}  解析后的 JSON
  */
-async function callGemini({ apiKey, modelName = "gemini-2.0-flash", systemPrompt, history, userMessage, responseSchema }) {
+/**
+ * 从 429 响应体中提取建议的等待秒数（retryDelay 字段）
+ * 返回毫秒数，找不到则返回保底值
+ */
+function parseRetryDelay(errBody, fallbackMs = 65000) {
+  try {
+    const obj = JSON.parse(errBody);
+    const details = obj?.error?.details ?? [];
+    for (const d of details) {
+      if (d["@type"]?.includes("RetryInfo") && d.retryDelay) {
+        const seconds = parseInt(d.retryDelay, 10);
+        if (!isNaN(seconds)) return (seconds + 5) * 1000; // 多等5秒余量
+      }
+    }
+  } catch { /* 解析失败忽略 */ }
+  return fallbackMs;
+}
+
+async function callGemini({ apiKey, modelName = "gemini-2.5-flash-lite", systemPrompt, history, userMessage, responseSchema }) {
   const url = `${GEMINI_BASE_URL}/${modelName}:generateContent?key=${apiKey}`;
 
   // 将内部历史格式转换为 Gemini contents 格式
@@ -54,32 +72,61 @@ async function callGemini({ apiKey, modelName = "gemini-2.0-flash", systemPrompt
     },
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  // 最多重试 4 次（429 限速 + 503 过载均自动重试）
+  const MAX_RETRIES = 4;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${errText}`);
-  }
+    if (res.status === 429) {
+      const errText = await res.text();
+      const waitMs = parseRetryDelay(errText, 65000);
+      const waitSec = Math.round(waitMs / 1000);
+      if (attempt < MAX_RETRIES) {
+        process.stdout.write(`\n  [限速 429] 等待 ${waitSec}s 后重试 (${attempt}/${MAX_RETRIES})... `);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw new Error(`Gemini API error 429（已重试 ${MAX_RETRIES} 次）: ${errText}`);
+    }
 
-  const data = await res.json();
-  const candidates = data?.candidates;
-  if (!candidates || candidates.length === 0) {
-    throw new Error("Gemini returned no candidates");
-  }
+    if (res.status === 503) {
+      const errText = await res.text();
+      // 503 过载：指数退避，20s / 40s / 80s
+      const waitMs = Math.min(20000 * Math.pow(2, attempt - 1), 120000);
+      const waitSec = Math.round(waitMs / 1000);
+      if (attempt < MAX_RETRIES) {
+        process.stdout.write(`\n  [过载 503] 等待 ${waitSec}s 后重试 (${attempt}/${MAX_RETRIES})... `);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      throw new Error(`Gemini API error 503（已重试 ${MAX_RETRIES} 次）: ${errText}`);
+    }
 
-  const parts = candidates[0]?.content?.parts || [];
-  // 过滤掉 thought 部分，只取实际 JSON 输出
-  const textParts = parts.filter((p) => !p.thought);
-  const rawText = textParts.map((p) => p.text).join("");
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Gemini API error ${res.status}: ${errText}`);
+    }
 
-  try {
-    return JSON.parse(rawText);
-  } catch {
-    throw new Error(`Failed to parse Gemini response as JSON: ${rawText}`);
+    const data = await res.json();
+    const candidates = data?.candidates;
+    if (!candidates || candidates.length === 0) {
+      throw new Error("Gemini returned no candidates");
+    }
+
+    const parts = candidates[0]?.content?.parts || [];
+    // 过滤掉 thought 部分，只取实际 JSON 输出
+    const textParts = parts.filter((p) => !p.thought);
+    const rawText = textParts.map((p) => p.text).join("");
+
+    try {
+      return JSON.parse(rawText);
+    } catch {
+      throw new Error(`Failed to parse Gemini response as JSON: ${rawText}`);
+    }
   }
 }
 
@@ -116,12 +163,13 @@ const DIALOGUE_SCHEMA = {
 /**
  * 执行一个完整的 scenario。
  *
- * @param {object} character  来自 characters-data.js 的角色对象（已深拷贝）
- * @param {object} scenario   scenario 定义对象，格式见 char*-scenarios.js
- * @param {string} apiKey     Gemini API Key
+ * @param {object} character   来自 characters-data.js 的角色对象（已深拷贝）
+ * @param {object} scenario    scenario 定义对象，格式见 char*-scenarios.js
+ * @param {string} apiKey      Gemini API Key
+ * @param {string} [modelName] 模型名称，默认 gemini-2.5-flash-lite
  * @returns {Promise<ScenarioResult>}
  */
-export async function runScenario(character, scenario, apiKey) {
+export async function runScenario(character, scenario, apiKey, modelName = "gemini-2.5-flash-lite") {
   let currentChar = { ...character };
   let closingStreak = 0;
   const history = []; // { role: 'user'|'model', text: string }
@@ -143,7 +191,7 @@ export async function runScenario(character, scenario, apiKey) {
     try {
       result = await callGemini({
         apiKey,
-        modelName: "gemini-2.0-flash",
+        modelName,
         systemPrompt: currentChar.systemPrompt,
         history,
         userMessage: input,
@@ -215,6 +263,11 @@ export async function runScenario(character, scenario, apiKey) {
       console.log("  → closing 触发，终止 scenario");
       break;
     }
+
+    // turn 间隔：免费 tier 5次/分钟 → 每次至少间隔 13 秒
+    if (i < scenario.inputs.length - 1) {
+      await new Promise((r) => setTimeout(r, 13000));
+    }
   }
 
   return {
@@ -222,6 +275,7 @@ export async function runScenario(character, scenario, apiKey) {
     scenario_name: scenario.name,
     character_id: character.id,
     character_name: character.name,
+    model: modelName,
     intent: scenario.intent,
     expected: scenario.expected,
     final_candor: currentChar.currentCandor,

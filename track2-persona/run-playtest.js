@@ -6,12 +6,16 @@
  * 用法：
  *   node track2-persona/run-playtest.js
  *   node track2-persona/run-playtest.js --char=char1
- *   node track2-persona/run-playtest.js --char=char2
- *   node track2-persona/run-playtest.js --char=char3
+ *   node track2-persona/run-playtest.js --char=char1 --scenario=C1-5
+ *   node track2-persona/run-playtest.js --model=gemini-2.5-flash-lite
+ *   node track2-persona/run-playtest.js --char=char1 --scenario=C1-5 --model=gemini-2.5-pro
  *
  * 环境变量：
  *   GEMINI_API_KEY   必填，Gemini API Key
- *   GEMINI_MODEL     可选，默认 gemini-2.0-flash
+ *   GEMINI_MODEL     可选，优先级低于 --model 参数，低于 config.local.js
+ *
+ * 模型优先级（高→低）：
+ *   --model= 参数 > GEMINI_MODEL 环境变量 > NPC-/config.local.js > 默认值 gemini-2.5-flash-lite
  *
  * 输出：
  *   reports/persona/YYYY-MM-DD_HH-MM-SS/
@@ -35,24 +39,43 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── 配置 ───────────────────────────────────────────────────────────────────
 
-function getApiKey() {
-  if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
-  // 尝试读取 NPC-/config.local.js 里的 GEMINI_PRESET_KEY（简单文本提取）
+function readConfigLocal() {
   try {
     const configPath = resolve(__dirname, "../../NPC-/config.local.js");
     const content = readFileSync(configPath, "utf-8");
-    const match = content.match(/GEMINI_PRESET_KEY\s*=\s*["']([^"']+)["']/);
-    if (match) return match[1];
+    const keyMatch = content.match(/GEMINI_PRESET_KEY\s*=\s*["']([^"']+)["']/);
+    const modelMatch = content.match(/GEMINI_PRESET_MODEL\s*=\s*["']([^"']+)["']/);
+    return {
+      key: keyMatch?.[1] ?? null,
+      model: modelMatch?.[1] ?? null,
+    };
   } catch {
-    // 文件不存在或读取失败，继续
+    return { key: null, model: null };
   }
-  return null;
+}
+
+function getApiKey(configLocal) {
+  return process.env.GEMINI_API_KEY || configLocal.key || null;
+}
+
+function getModelName(configLocal, argModel) {
+  // 优先级：--model 参数 > 环境变量 > config.local.js > 默认值
+  return (
+    argModel ||
+    process.env.GEMINI_MODEL ||
+    configLocal.model ||
+    "gemini-2.5-flash-lite"
+  );
 }
 
 function parseArgs() {
-  const charArg = process.argv.find((a) => a.startsWith("--char="));
+  const charArg     = process.argv.find((a) => a.startsWith("--char="));
+  const modelArg    = process.argv.find((a) => a.startsWith("--model="));
+  const scenarioArg = process.argv.find((a) => a.startsWith("--scenario="));
   return {
-    charFilter: charArg ? charArg.split("=")[1] : null,
+    charFilter:     charArg     ? charArg.split("=")[1]     : null,
+    modelArg:       modelArg    ? modelArg.split("=")[1]    : null,
+    scenarioFilter: scenarioArg ? scenarioArg.split("=")[1] : null,
   };
 }
 
@@ -91,22 +114,29 @@ const ALL_CHAR_SCENARIOS = [
 ];
 
 async function main() {
-  const apiKey = getApiKey();
+  const configLocal = readConfigLocal();
+  const { charFilter, modelArg, scenarioFilter } = parseArgs();
+
+  const apiKey   = getApiKey(configLocal);
+  const modelName = getModelName(configLocal, modelArg);
+
   if (!apiKey) {
     console.error(
       "错误：未找到 Gemini API Key。\n" +
-      "请设置环境变量 GEMINI_API_KEY，或在 NPC-/config.local.js 中配置 GEMINI_PRESET_KEY。"
+      "方式1: 设置环境变量 GEMINI_API_KEY\n" +
+      "方式2: 在 NPC-/config.local.js 中配置 GEMINI_PRESET_KEY"
     );
     process.exit(1);
   }
 
-  const { charFilter } = parseArgs();
   const reportDir = makeReportDir();
 
   console.log("═══════════════════════════════════════════════");
   console.log("NPC 人设表现 Playtest — Track 2");
+  console.log(`模型:     ${modelName}`);
   console.log(`报告目录: ${reportDir}`);
-  if (charFilter) console.log(`筛选角色: ${charFilter}`);
+  if (charFilter)     console.log(`筛选角色:     ${charFilter}`);
+  if (scenarioFilter) console.log(`筛选 scenario: ${scenarioFilter}`);
   console.log("═══════════════════════════════════════════════");
 
   const summaryRows = [];
@@ -120,12 +150,12 @@ async function main() {
     console.log(`\n▶ 角色: ${character.name} (${charId})`);
     console.log("─".repeat(47));
 
-    for (const scenario of scenarios) {
+    for (const scenario of scenarios.filter(s => !scenarioFilter || s.id === scenarioFilter)) {
       totalScenarios++;
       let result;
 
       try {
-        result = await runScenario(character, scenario, apiKey);
+        result = await runScenario(character, scenario, apiKey, modelName);
       } catch (err) {
         console.error(`  FATAL ERROR in ${scenario.id}: ${err.message}`);
         errorCount++;
@@ -171,8 +201,8 @@ async function main() {
         report_file: filename,
       });
 
-      // 轮次间间隔，避免 API 限速
-      await sleep(800);
+      // scenario 间隔，避免 API 限速（免费 tier 5次/分钟）
+      await sleep(15000);
     }
   }
 
@@ -180,6 +210,7 @@ async function main() {
   const summaryPath = resolve(reportDir, "summary.json");
   const summary = {
     ran_at: new Date().toISOString(),
+    model: modelName,
     total_scenarios: totalScenarios,
     error_count: errorCount,
     char_filter: charFilter ?? "all",

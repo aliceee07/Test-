@@ -57,14 +57,34 @@ GEMINI_API_KEY=你的APIKey node track2-persona/run-playtest.js
 
 方式二：在 `NPC-/config.local.js` 中已配置 `GEMINI_PRESET_KEY` 的话，脚本会自动读取。
 
+### 模型选择
+
+支持通过多种方式指定模型，优先级从高到低：
+
+| 方式 | 示例 |
+|---|---|
+| `--model=` 参数 | `node ... --model=gemini-2.5-pro` |
+| 环境变量 `GEMINI_MODEL` | `$env:GEMINI_MODEL = "gemini-2.5-flash"` |
+| `NPC-/config.local.js` | `GEMINI_PRESET_MODEL = "gemini-2.5-flash-lite"` |
+| 默认值 | `gemini-2.5-flash-lite` |
+
+常用模型名称：
+- `gemini-2.5-flash-lite` （默认，速度快）
+- `gemini-2.5-flash`
+- `gemini-2.5-pro` （最强，较慢）
+- `gemini-2.0-flash`
+
 ### 运行
 
 ```bash
-# 跑全部 13 个 scenario（3个角色）
+# 跑全部 13 个 scenario（3个角色），使用默认模型
 node track2-persona/run-playtest.js
 
-# 只跑某一个角色
-node track2-persona/run-playtest.js --char=char1
+# 指定模型
+node track2-persona/run-playtest.js --model=gemini-2.5-pro
+
+# 只跑某一个角色 + 指定模型
+node track2-persona/run-playtest.js --char=char1 --model=gemini-2.5-flash-lite
 node track2-persona/run-playtest.js --char=char2
 node track2-persona/run-playtest.js --char=char3
 ```
