@@ -43,19 +43,40 @@ function readConfigLocal() {
   try {
     const configPath = resolve(__dirname, "../../NPC-/config.local.js");
     const content = readFileSync(configPath, "utf-8");
+
+    // 单 key：GEMINI_PRESET_KEY = "xxx"
     const keyMatch = content.match(/GEMINI_PRESET_KEY\s*=\s*["']([^"']+)["']/);
+
+    // 多 key：GEMINI_PRESET_KEYS = ["key1", "key2", ...]
+    const keysMatch = content.match(/GEMINI_PRESET_KEYS\s*=\s*\[([^\]]+)\]/);
+    let keys = [];
+    if (keysMatch) {
+      keys = [...keysMatch[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1]).filter(Boolean);
+    }
+
     const modelMatch = content.match(/GEMINI_PRESET_MODEL\s*=\s*["']([^"']+)["']/);
     return {
-      key: keyMatch?.[1] ?? null,
+      key:   keyMatch?.[1] ?? null,
+      keys,
       model: modelMatch?.[1] ?? null,
     };
   } catch {
-    return { key: null, model: null };
+    return { key: null, keys: [], model: null };
   }
 }
 
-function getApiKey(configLocal) {
-  return process.env.GEMINI_API_KEY || configLocal.key || null;
+/**
+ * 合并所有来源的 key，去重后返回数组。
+ * 优先级：环境变量 > GEMINI_PRESET_KEYS 数组 > GEMINI_PRESET_KEY 单个
+ */
+function getApiKeys(configLocal) {
+  const all = [
+    ...(process.env.GEMINI_API_KEY ? [process.env.GEMINI_API_KEY] : []),
+    ...configLocal.keys,
+    ...(configLocal.key ? [configLocal.key] : []),
+  ];
+  // 去重（保持顺序）
+  return [...new Set(all.filter(Boolean))];
 }
 
 function getModelName(configLocal, argModel) {
@@ -117,25 +138,30 @@ async function main() {
   const configLocal = readConfigLocal();
   const { charFilter, modelArg, scenarioFilter } = parseArgs();
 
-  const apiKey   = getApiKey(configLocal);
+  const apiKeys  = getApiKeys(configLocal);
   const modelName = getModelName(configLocal, modelArg);
 
-  if (!apiKey) {
+  if (apiKeys.length === 0) {
     console.error(
       "错误：未找到 Gemini API Key。\n" +
       "方式1: 设置环境变量 GEMINI_API_KEY\n" +
-      "方式2: 在 NPC-/config.local.js 中配置 GEMINI_PRESET_KEY"
+      "方式2: 在 NPC-/config.local.js 中配置 GEMINI_PRESET_KEY（单个）\n" +
+      "方式3: 在 NPC-/config.local.js 中配置 GEMINI_PRESET_KEYS（多个数组）"
     );
     process.exit(1);
   }
+
+  // 共享 key 轮换状态，跨所有 scenario 保持 key 索引
+  const keyState = { index: 0 };
 
   const reportDir = makeReportDir();
 
   console.log("═══════════════════════════════════════════════");
   console.log("NPC 人设表现 Playtest — Track 2");
   console.log(`模型:     ${modelName}`);
+  console.log(`API Key:  ${apiKeys.length} 个（自动轮换）`);
   console.log(`报告目录: ${reportDir}`);
-  if (charFilter)     console.log(`筛选角色:     ${charFilter}`);
+  if (charFilter)     console.log(`筛选角色:      ${charFilter}`);
   if (scenarioFilter) console.log(`筛选 scenario: ${scenarioFilter}`);
   console.log("═══════════════════════════════════════════════");
 
@@ -155,7 +181,7 @@ async function main() {
       let result;
 
       try {
-        result = await runScenario(character, scenario, apiKey, modelName);
+        result = await runScenario(character, scenario, apiKeys, modelName, keyState);
       } catch (err) {
         console.error(`  FATAL ERROR in ${scenario.id}: ${err.message}`);
         errorCount++;
@@ -211,6 +237,7 @@ async function main() {
   const summary = {
     ran_at: new Date().toISOString(),
     model: modelName,
+    api_key_count: apiKeys.length,
     total_scenarios: totalScenarios,
     error_count: errorCount,
     char_filter: charFilter ?? "all",

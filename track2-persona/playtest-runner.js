@@ -34,27 +34,43 @@ const CLOSE_THRESHOLD = 3;
  * @returns {Promise<object>}  解析后的 JSON
  */
 /**
- * 从 429 响应体中提取建议的等待秒数（retryDelay 字段）
- * 返回毫秒数，找不到则返回保底值
+ * 从 429 响应体中提取建议的等待秒数
+ * 返回 { waitMs, isDaily }
+ *   isDaily=true  表示日配额耗尽（retryDelay > 120s），应切换 key
+ *   isDaily=false 表示分钟限速，等待后可用同一 key 重试
  */
-function parseRetryDelay(errBody, fallbackMs = 65000) {
+function parseRetryInfo(errBody) {
   try {
     const obj = JSON.parse(errBody);
     const details = obj?.error?.details ?? [];
     for (const d of details) {
       if (d["@type"]?.includes("RetryInfo") && d.retryDelay) {
         const seconds = parseInt(d.retryDelay, 10);
-        if (!isNaN(seconds)) return (seconds + 5) * 1000; // 多等5秒余量
+        if (!isNaN(seconds)) {
+          return {
+            waitMs: (seconds + 5) * 1000,
+            isDaily: seconds > 120,
+          };
+        }
       }
     }
   } catch { /* 解析失败忽略 */ }
-  return fallbackMs;
+  return { waitMs: 65000, isDaily: false };
 }
 
-async function callGemini({ apiKey, modelName = "gemini-2.5-flash-lite", systemPrompt, history, userMessage, responseSchema }) {
-  const url = `${GEMINI_BASE_URL}/${modelName}:generateContent?key=${apiKey}`;
-
-  // 将内部历史格式转换为 Gemini contents 格式
+/**
+ * 调用 Gemini API，支持多 key 自动轮换。
+ *
+ * @param {object} opts
+ * @param {string[]} opts.apiKeys     API Key 数组（至少1个）
+ * @param {object}  opts.keyState     共享可变对象 { index: number }，跨调用保持 key 位置
+ * @param {string}  opts.modelName
+ * @param {string}  opts.systemPrompt
+ * @param {Array}   opts.history
+ * @param {string}  opts.userMessage
+ * @param {object}  opts.responseSchema
+ */
+async function callGemini({ apiKeys, keyState, modelName = "gemini-2.5-flash-lite", systemPrompt, history, userMessage, responseSchema }) {
   const contents = [
     ...history.map((msg) => ({
       role: msg.role === "user" ? "user" : "model",
@@ -72,60 +88,99 @@ async function callGemini({ apiKey, modelName = "gemini-2.5-flash-lite", systemP
     },
   };
 
-  // 最多重试 4 次（429 限速 + 503 过载均自动重试）
-  const MAX_RETRIES = 4;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+  // 每个 key 最多重试 3 次（针对分钟限速 + 503 过载）
+  const MAX_RETRIES_PER_KEY = 3;
+  // 总尝试次数上限 = key数量 × 每key重试次数
+  const totalKeys = apiKeys.length;
+  let keysTriedFromCurrent = 0;
 
-    if (res.status === 429) {
-      const errText = await res.text();
-      const waitMs = parseRetryDelay(errText, 65000);
-      const waitSec = Math.round(waitMs / 1000);
-      if (attempt < MAX_RETRIES) {
-        process.stdout.write(`\n  [限速 429] 等待 ${waitSec}s 后重试 (${attempt}/${MAX_RETRIES})... `);
-        await new Promise((r) => setTimeout(r, waitMs));
-        continue;
+  while (true) {
+    const currentKey = apiKeys[keyState.index];
+    const url = `${GEMINI_BASE_URL}/${modelName}:generateContent?key=${currentKey}`;
+
+    let attemptsThisKey = 0;
+    let rotated = false;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES_PER_KEY; attempt++) {
+      attemptsThisKey++;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      // ── 429 限速 ──────────────────────────────────────────────────────────
+      if (res.status === 429) {
+        const errText = await res.text();
+        const { waitMs, isDaily } = parseRetryInfo(errText);
+        const waitSec = Math.round(waitMs / 1000);
+        const keyLabel = `key[${keyState.index + 1}/${totalKeys}]`;
+
+        if (isDaily) {
+          // 日配额耗尽 → 立即切换下一个 key
+          process.stdout.write(`\n  [日配额耗尽 ${keyLabel}] 切换到下一个 key... `);
+          rotated = true;
+          break;
+        } else if (attempt < MAX_RETRIES_PER_KEY) {
+          // 分钟限速 → 等待后重试同一 key
+          process.stdout.write(`\n  [限速 429 ${keyLabel}] 等待 ${waitSec}s 后重试 (${attempt}/${MAX_RETRIES_PER_KEY})... `);
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        } else {
+          // 同一 key 重试次数耗尽 → 切换
+          process.stdout.write(`\n  [限速 429 ${keyLabel}] 重试耗尽，切换到下一个 key... `);
+          rotated = true;
+          break;
+        }
       }
-      throw new Error(`Gemini API error 429（已重试 ${MAX_RETRIES} 次）: ${errText}`);
-    }
 
-    if (res.status === 503) {
-      const errText = await res.text();
-      // 503 过载：指数退避，20s / 40s / 80s
-      const waitMs = Math.min(20000 * Math.pow(2, attempt - 1), 120000);
-      const waitSec = Math.round(waitMs / 1000);
-      if (attempt < MAX_RETRIES) {
-        process.stdout.write(`\n  [过载 503] 等待 ${waitSec}s 后重试 (${attempt}/${MAX_RETRIES})... `);
-        await new Promise((r) => setTimeout(r, waitMs));
-        continue;
+      // ── 503 过载 ──────────────────────────────────────────────────────────
+      if (res.status === 503) {
+        const errText = await res.text();
+        const keyLabel = `key[${keyState.index + 1}/${totalKeys}]`;
+        if (attempt < MAX_RETRIES_PER_KEY) {
+          const waitMs = Math.min(20000 * Math.pow(2, attempt - 1), 120000);
+          const waitSec = Math.round(waitMs / 1000);
+          process.stdout.write(`\n  [过载 503 ${keyLabel}] 等待 ${waitSec}s 后重试 (${attempt}/${MAX_RETRIES_PER_KEY})... `);
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        } else {
+          process.stdout.write(`\n  [过载 503 ${keyLabel}] 重试耗尽，切换到下一个 key... `);
+          rotated = true;
+          break;
+        }
       }
-      throw new Error(`Gemini API error 503（已重试 ${MAX_RETRIES} 次）: ${errText}`);
+
+      // ── 其他错误 ──────────────────────────────────────────────────────────
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Gemini API error ${res.status}: ${errText}`);
+      }
+
+      // ── 成功 ──────────────────────────────────────────────────────────────
+      const data = await res.json();
+      const candidates = data?.candidates;
+      if (!candidates || candidates.length === 0) {
+        throw new Error("Gemini returned no candidates");
+      }
+      const parts = candidates[0]?.content?.parts || [];
+      const textParts = parts.filter((p) => !p.thought);
+      const rawText = textParts.map((p) => p.text).join("");
+      try {
+        return JSON.parse(rawText);
+      } catch {
+        throw new Error(`Failed to parse Gemini response as JSON: ${rawText}`);
+      }
     }
 
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Gemini API error ${res.status}: ${errText}`);
-    }
-
-    const data = await res.json();
-    const candidates = data?.candidates;
-    if (!candidates || candidates.length === 0) {
-      throw new Error("Gemini returned no candidates");
-    }
-
-    const parts = candidates[0]?.content?.parts || [];
-    // 过滤掉 thought 部分，只取实际 JSON 输出
-    const textParts = parts.filter((p) => !p.thought);
-    const rawText = textParts.map((p) => p.text).join("");
-
-    try {
-      return JSON.parse(rawText);
-    } catch {
-      throw new Error(`Failed to parse Gemini response as JSON: ${rawText}`);
+    // 需要切换 key
+    if (rotated) {
+      keysTriedFromCurrent++;
+      if (keysTriedFromCurrent >= totalKeys) {
+        throw new Error(`所有 ${totalKeys} 个 API Key 均已耗尽配额或不可用，请明天再试。`);
+      }
+      keyState.index = (keyState.index + 1) % totalKeys;
+      process.stdout.write(`→ 切换至 key[${keyState.index + 1}/${totalKeys}]\n`);
     }
   }
 }
@@ -163,13 +218,14 @@ const DIALOGUE_SCHEMA = {
 /**
  * 执行一个完整的 scenario。
  *
- * @param {object} character   来自 characters-data.js 的角色对象（已深拷贝）
- * @param {object} scenario    scenario 定义对象，格式见 char*-scenarios.js
- * @param {string} apiKey      Gemini API Key
- * @param {string} [modelName] 模型名称，默认 gemini-2.5-flash-lite
+ * @param {object}   character   来自 characters-data.js 的角色对象（已深拷贝）
+ * @param {object}   scenario    scenario 定义对象，格式见 char*-scenarios.js
+ * @param {string[]} apiKeys     API Key 数组（单个 key 也传 [key]）
+ * @param {string}   [modelName] 模型名称，默认 gemini-2.5-flash-lite
+ * @param {object}   [keyState]  共享 key 索引状态 { index: number }，跨 scenario 保持
  * @returns {Promise<ScenarioResult>}
  */
-export async function runScenario(character, scenario, apiKey, modelName = "gemini-2.5-flash-lite") {
+export async function runScenario(character, scenario, apiKeys, modelName = "gemini-2.5-flash-lite", keyState = { index: 0 }) {
   let currentChar = { ...character };
   let closingStreak = 0;
   const history = []; // { role: 'user'|'model', text: string }
@@ -190,7 +246,8 @@ export async function runScenario(character, scenario, apiKey, modelName = "gemi
     let result;
     try {
       result = await callGemini({
-        apiKey,
+        apiKeys,
+        keyState,
         modelName,
         systemPrompt: currentChar.systemPrompt,
         history,
